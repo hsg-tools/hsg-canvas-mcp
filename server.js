@@ -1,7 +1,8 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
+const MCP_PORT = 3001;
 const SECRET_PATH = process.env.MCP_SECRET_PATH;
 
 if (!SECRET_PATH) {
@@ -9,8 +10,7 @@ if (!SECRET_PATH) {
   process.exit(1);
 }
 
-const MCP_PORT = 3001;
-
+// Canvas MCP nur intern auf localhost starten
 const child = spawn(
   "npx",
   [
@@ -24,55 +24,64 @@ const child = spawn(
   ],
   {
     stdio: "inherit",
-    env: {
-      ...process.env
-    }
+    env: process.env
   }
 );
 
-child.on("exit", code => {
+child.on("exit", (code) => {
   console.error(`Canvas MCP exited with code ${code}`);
   process.exit(code ?? 1);
 });
 
-const proxy = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => {
+  // Öffentlicher Health Check
   if (req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
+    res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ status: "ok" }));
     return;
   }
 
-  const allowedPath = `/mcp/${SECRET_PATH}`;
+  const expectedPath = `/mcp/${SECRET_PATH}`;
 
-  if (req.url !== allowedPath) {
-    res.writeHead(404);
+  if (req.url !== expectedPath) {
+    res.writeHead(404, { "content-type": "text/plain" });
     res.end("Not found");
     return;
   }
 
-  const body = [];
-  for await (const chunk of req) body.push(chunk);
+  // Alle wichtigen MCP-Header weiterreichen.
+  // Origin wird absichtlich entfernt, da der eigentliche MCP nur lokal
+  // hinter diesem Proxy erreichbar ist.
+  const headers = { ...req.headers };
+  delete headers.host;
+  delete headers.origin;
+  delete headers.connection;
 
-  const upstream = await fetch(`http://127.0.0.1:${MCP_PORT}/mcp`, {
-    method: req.method,
-    headers: {
-      "content-type": req.headers["content-type"] || "application/json",
-      accept: req.headers["accept"] || "application/json, text/event-stream"
+  const upstream = http.request(
+    {
+      hostname: "127.0.0.1",
+      port: MCP_PORT,
+      path: "/mcp",
+      method: req.method,
+      headers
     },
-    body: ["GET", "HEAD"].includes(req.method) ? undefined : Buffer.concat(body)
+    (upstreamRes) => {
+      res.writeHead(upstreamRes.statusCode ?? 500, upstreamRes.headers);
+      upstreamRes.pipe(res);
+    }
+  );
+
+  upstream.on("error", (err) => {
+    console.error("Upstream MCP error:", err);
+    if (!res.headersSent) {
+      res.writeHead(502, { "content-type": "text/plain" });
+    }
+    res.end("MCP upstream unavailable");
   });
 
-  res.writeHead(upstream.status, Object.fromEntries(upstream.headers.entries()));
-
-  if (upstream.body) {
-    for await (const chunk of upstream.body) {
-      res.write(chunk);
-    }
-  }
-
-  res.end();
+  req.pipe(upstream);
 });
 
-proxy.listen(PORT, "0.0.0.0", () => {
-  console.log(`Proxy listening on port ${PORT}`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Secure MCP proxy listening on port ${PORT}`);
 });
